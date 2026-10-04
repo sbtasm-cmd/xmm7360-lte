@@ -78,3 +78,7 @@ sudo nmcli connection add type gsm ifname '*' con-name lte gsm.apn internet \
 
 - [xmm7360-pci](https://github.com/xmm7360/xmm7360-pci) for the RPC protocol work and the Python helpers.
 - ModemManager's XMM7360 RPC plugin and the ArchWiki *Intel XMM 7360* page.
+
+## License
+
+GPL-2.0-or-later (see `LICENSE`), the same license as ModemManager.
