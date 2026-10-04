@@ -4,7 +4,8 @@ LTE on Linux for the Intel XMM7360 (Fibocom L850-GL) modem on laptops where it
 registers fine under Windows but never finds a network under Linux.
 
 Tested on a ThinkPad X1 Yoga Gen 5 (20UB), Arch Linux (Omarchy), kernel 7.2,
-`iosm` driver, ModemManager git `338ecc06`.
+`iosm` driver, ModemManager git `338ecc06`, with lifecell (UA) on LTE. Works
+from a cold boot (full power-off) with no manual steps.
 
 ## Symptom
 

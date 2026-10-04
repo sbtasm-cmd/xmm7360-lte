@@ -3,7 +3,7 @@
 pkgname=modemmanager-xmm7360-git
 _commit=338ecc06
 pkgver=1.25.95.r9609.g338ecc06
-pkgrel=2
+pkgrel=3
 pkgdesc="ModemManager (git) with Intel XMM7360 support and protocol-stack power-on fix"
 arch=(x86_64)
 url="https://www.freedesktop.org/wiki/Software/ModemManager/"
@@ -29,6 +29,7 @@ prepare() {
 build() {
   arch-meson mm build \
     -D qmi=false -D qrtr=false -D plugin_qcom_soc=disabled \
+    -D plugin_mtk=disabled -D plugin_mtk_legacy=disabled -D plugin_rolling=disabled \
     -D tests=false -D vapi=false -D man=false \
     -D polkit=permissive \
     -D systemdsystemunitdir=/usr/lib/systemd/system \
