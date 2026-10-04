@@ -1,0 +1,41 @@
+# ModemManager from git main with native Intel XMM7360 RPC support, plus the
+# protocol-stack power-on fix from this repository.
+pkgname=modemmanager-xmm7360-git
+_commit=338ecc06
+pkgver=1.25.95.r9609.g338ecc06
+pkgrel=2
+pkgdesc="ModemManager (git) with Intel XMM7360 support and protocol-stack power-on fix"
+arch=(x86_64)
+url="https://www.freedesktop.org/wiki/Software/ModemManager/"
+license=(GPL-2.0-or-later LGPL-2.1-or-later)
+depends=(bash glib2 glibc gcc-libs libgudev libmbim polkit systemd-libs mobile-broadband-provider-info tinyxxd)
+makedepends=(git meson gobject-introspection glib2-devel)
+provides=(modemmanager=1.25.95 libmm-glib=1.25.95 libmm-glib.so)
+conflicts=(modemmanager libmm-glib)
+source=("mm::git+https://gitlab.freedesktop.org/mobile-broadband/ModemManager.git#commit=${_commit}"
+        0001-intel-xmm7360-power-on-the-protocol-stack.patch)
+sha256sums=(SKIP SKIP)
+
+pkgver() {
+  cd mm
+  printf "1.25.95.r%s.g%s" "$(git rev-list --count HEAD)" "$(git rev-parse --short HEAD)"
+}
+
+prepare() {
+  cd mm
+  patch -Np1 -i ../0001-intel-xmm7360-power-on-the-protocol-stack.patch
+}
+
+build() {
+  arch-meson mm build \
+    -D qmi=false -D qrtr=false -D plugin_qcom_soc=disabled \
+    -D tests=false -D vapi=false -D man=false \
+    -D polkit=permissive \
+    -D systemdsystemunitdir=/usr/lib/systemd/system \
+    -D udevdir=/usr/lib/udev
+  meson compile -C build
+}
+
+package() {
+  meson install -C build --destdir "$pkgdir"
+}

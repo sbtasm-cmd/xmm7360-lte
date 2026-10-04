@@ -1,0 +1,163 @@
+From 29a7145a6b91b7293c8127bd524e9b7dae9369e1 Mon Sep 17 00:00:00 2001
+From: "Nohdan S." <sbtasm@gmail.com>
+Date: Sun, 4 Oct 2026 16:39:54 +0300
+Subject: [PATCH] intel: xmm7360: power on the protocol stack like the Windows
+ driver
+
+Some XMM7360 modems (seen on a ThinkPad X1 Yoga Gen 5) stay in an
+internal airplane mode after the UTA mode is set: AT+CFUN? reports 1,
+but COPS stays at 2, CEREG at 0, signal reporting at 99/255, and
+AT+COPS=0 fails with "No network service". No attach-allowed indication
+ever arrives, and UtaMsNetAttachReq fails.
+
+The Windows driver (Lenovo WinIhvRil.dll, FUN_MODE_STACK_ON) switches
+the cellular protocol stack on with UtaMsCpsSetStackModeConfiguration
+(stack on, sim 0) and UtaMsCpsSetModeReq (mode on, sim 0). After these
+calls the modem sends UtaMsCpsSetModeIndCb, accepts automatic network
+selection, registers, and attaches.
+
+Send both calls at the end of the init sequence (power-up is skipped
+when the modem already reports CFUN=1) and again after the UTA mode set
+in power-up. Errors in these steps are only logged.
+---
+ .../intel/mm-broadband-modem-xmm7360.c        | 96 ++++++++++++++++++-
+ 1 file changed, 91 insertions(+), 5 deletions(-)
+
+diff --git a/src/plugins/intel/mm-broadband-modem-xmm7360.c b/src/plugins/intel/mm-broadband-modem-xmm7360.c
+index fc366228..1d8bcfb3 100644
+--- a/src/plugins/intel/mm-broadband-modem-xmm7360.c
++++ b/src/plugins/intel/mm-broadband-modem-xmm7360.c
+@@ -665,6 +665,51 @@ mm_broadband_modem_xmm7360_check_fcc_lock (MMBroadbandModemXmm7360   *self,
+                                                  task);
+ }
+ 
++/*****************************************************************************/
++/* Protocol stack on (FUN_MODE_STACK_ON)
++ *
++ * The Windows driver (Lenovo WinIhvRil.dll) switches the cellular protocol
++ * stack on after the UTA mode is set, with UtaMsCpsSetStackModeConfiguration
++ * and UtaMsCpsSetModeReq. Without these some modems stay in an internal
++ * airplane mode: CFUN=1 but COPS=2 and no network search. */
++
++static const Xmm7360RpcMsgArg cps_set_stack_mode_on_args[] = {
++    { XMM7360_RPC_MSG_ARG_TYPE_LONG, { .l = 1 } }, /* stack mode: on */
++    { XMM7360_RPC_MSG_ARG_TYPE_LONG, { .l = 0 } }, /* sim id */
++    { XMM7360_RPC_MSG_ARG_TYPE_UNKNOWN },
++};
++
++static const Xmm7360RpcMsgArg cps_set_mode_on_args[] = {
++    { XMM7360_RPC_MSG_ARG_TYPE_LONG, { .l = 0x10 } }, /* callback transaction id */
++    { XMM7360_RPC_MSG_ARG_TYPE_LONG, { .l = 0 } },
++    { XMM7360_RPC_MSG_ARG_TYPE_LONG, { .l = 0 } },
++    { XMM7360_RPC_MSG_ARG_TYPE_LONG, { .l = 1 } },    /* mode: on */
++    { XMM7360_RPC_MSG_ARG_TYPE_LONG, { .l = 0 } },    /* sim id */
++    { XMM7360_RPC_MSG_ARG_TYPE_UNKNOWN },
++};
++
++static MMBroadbandModemXmm7360RpcResponseProcessorResult
++stack_on_response_processor (MMBroadbandModemXmm7360  *self,
++                             Xmm7360RpcResponse       *response,
++                             gboolean                  last_command,
++                             const GError             *error,
++                             GError                  **result_error)
++{
++    if (error)
++        mm_obj_warn (self, "(intel) protocol stack power-on step failed (ignored): %s", error->message);
++
++    *result_error = NULL;
++    return (last_command ?
++            MM_BROADBAND_MODEM_XMM7360_RPC_RESPONSE_PROCESSOR_RESULT_SUCCESS :
++            MM_BROADBAND_MODEM_XMM7360_RPC_RESPONSE_PROCESSOR_RESULT_CONTINUE);
++}
++
++static const MMBroadbandModemXmm7360RpcCommand stack_on_sequence[] = {
++    { XMM7360_RPC_CALL_UTA_MS_CPS_SET_STACK_MODE_CONFIGURATION, FALSE, cps_set_stack_mode_on_args, 3, FALSE, FALSE, stack_on_response_processor },
++    { XMM7360_RPC_CALL_UTA_MS_CPS_SET_MODE_REQ, FALSE, cps_set_mode_on_args, 3, FALSE, FALSE, stack_on_response_processor },
++    { 0 }
++};
++
+ /*****************************************************************************/
+ 
+ typedef struct {
+@@ -721,6 +766,26 @@ parent_modem_power_up_ready (MMIfaceModem *self,
+     g_object_unref (task);
+ }
+ 
++static void
++power_up_stack_on_ready (MMBroadbandModem *self,
++                         GAsyncResult     *res,
++                         GTask            *task)
++{
++    g_autoptr(GError)             error = NULL;
++    g_autoptr(Xmm7360RpcResponse) response = NULL;
++
++    response = mm_broadband_modem_xmm7360_rpc_sequence_full_finish (MM_BROADBAND_MODEM_XMM7360 (self), res, &error);
++    if (error)
++        mm_obj_warn (self, "(intel) protocol stack power-on failed (ignored): %s", error->message);
++
++    mm_port_serial_close (MM_PORT_SERIAL (g_task_get_task_data (task)));
++
++    iface_modem_parent->modem_power_up (
++        MM_IFACE_MODEM (self),
++        (GAsyncReadyCallback)parent_modem_power_up_ready,
++        task);
++}
++
+ static void
+ modem_power_up_ready (MMIfaceModem *self,
+                       GAsyncResult *res,
+@@ -728,6 +793,7 @@ modem_power_up_ready (MMIfaceModem *self,
+ {
+     GError *error = NULL;
+     gboolean success;
++    MMPortSerialXmmrpcXmm7360 *port;
+ 
+     success = g_task_propagate_boolean (G_TASK (res), &error);
+     if (error || !success) {
+@@ -741,10 +807,26 @@ modem_power_up_ready (MMIfaceModem *self,
+         return;
+     }
+ 
+-    iface_modem_parent->modem_power_up (
+-        self,
+-        (GAsyncReadyCallback)parent_modem_power_up_ready,
+-        task);
++    port = mm_broadband_modem_xmm7360_get_port_xmmrpc (MM_BROADBAND_MODEM_XMM7360 (self));
++    if (!mm_port_serial_open (MM_PORT_SERIAL (port), &error)) {
++        mm_obj_warn (self, "(intel) couldn't open XMMRPC port to power on the protocol stack: %s", error->message);
++        g_clear_error (&error);
++        g_object_unref (port);
++        iface_modem_parent->modem_power_up (
++            self,
++            (GAsyncReadyCallback)parent_modem_power_up_ready,
++            task);
++        return;
++    }
++
++    g_task_set_task_data (task, port, (GDestroyNotify)g_object_unref);
++    mm_obj_dbg (self, "(intel) powering on the protocol stack...");
++    mm_broadband_modem_xmm7360_rpc_sequence_full (MM_BROADBAND_MODEM_XMM7360 (self),
++                                                  port,
++                                                  stack_on_sequence,
++                                                  NULL, /* cancellable */
++                                                  (GAsyncReadyCallback)power_up_stack_on_ready,
++                                                  task);
+ }
+ 
+ static gboolean
+@@ -1111,7 +1193,11 @@ static const MMBroadbandModemXmm7360RpcCommand init_sequence[] = {
+     { XMM7360_RPC_CALL_UTA_MS_CALL_CS_INIT, FALSE, NULL, 3, FALSE, FALSE, mm_broadband_modem_xmm7360_rpc_response_processor_continue_on_success },
+     { XMM7360_RPC_CALL_UTA_MS_CALL_PS_INITIALIZE, FALSE, NULL, 3, FALSE, FALSE, mm_broadband_modem_xmm7360_rpc_response_processor_continue_on_success },
+     { XMM7360_RPC_CALL_UTA_MS_SS_INIT, FALSE, NULL, 3, FALSE, FALSE, mm_broadband_modem_xmm7360_rpc_response_processor_continue_on_success },
+-    { XMM7360_RPC_CALL_UTA_MS_SIM_OPEN_REQ, FALSE, NULL, 3, FALSE, FALSE, mm_broadband_modem_xmm7360_rpc_response_processor_final },
++    { XMM7360_RPC_CALL_UTA_MS_SIM_OPEN_REQ, FALSE, NULL, 3, FALSE, FALSE, mm_broadband_modem_xmm7360_rpc_response_processor_continue_on_success },
++    /* Also power on the protocol stack here: if the modem already reports
++     * CFUN=1, the power-up step (and its stack power-on) is skipped. */
++    { XMM7360_RPC_CALL_UTA_MS_CPS_SET_STACK_MODE_CONFIGURATION, FALSE, cps_set_stack_mode_on_args, 3, FALSE, FALSE, stack_on_response_processor },
++    { XMM7360_RPC_CALL_UTA_MS_CPS_SET_MODE_REQ, FALSE, cps_set_mode_on_args, 3, FALSE, FALSE, stack_on_response_processor },
+     { 0 }
+ };
+ 
+-- 
+2.55.0
+
