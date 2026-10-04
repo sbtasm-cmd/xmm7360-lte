@@ -47,6 +47,7 @@ registers on LTE, and attaches. Details are in
 | `packaging/arch/PKGBUILD` | Arch package `modemmanager-xmm7360-git` (ModemManager git + patch) |
 | `system/install-system.sh` | Installs the package plus the FCC-unlock drop-in, the runtime-PM udev rule, and the resume reset service |
 | `tools/` | Diagnostic scripts (raw RPC and AT); run `tools/fetch-xmm7360-rpc.sh` first |
+| `omarchy-plugin/` | Omarchy bar widget `xmm7360.lte`: LTE signal, operator, and a mobile data switch |
 
 ## Install (Arch)
 
@@ -70,6 +71,21 @@ sudo nmcli connection add type gsm ifname '*' con-name lte gsm.apn internet \
 - **FCC unlock:** `ExecStartPre` runs `fcc-unlock.available.d/8086:7360` before ModemManager opens the RPC port.
 - **Runtime power management:** turned off for the modem, because it crashes the firmware.
 - **`wwan-resume-reset.service`:** resets the modem through ACPI `_RST` after resume, because the modem loses power in S3.
+
+## Omarchy bar widget
+
+`omarchy-plugin/` is a bar widget for [Omarchy](https://omarchy.org/). It shows
+signal bars computed from the real LTE RSRP. Clicking it opens a popup with the
+operator, registration, RSRP/RSRQ/SNR, the IP address, and a switch that brings
+the NetworkManager GSM profile up or down. Right-click toggles mobile data, and
+middle-click refreshes. It works with any ModemManager modem, not only the
+XMM7360.
+
+```sh
+ln -s "$PWD/omarchy-plugin" ~/.config/omarchy/plugins/xmm7360.lte
+omarchy-shell shell rescanPlugins
+omarchy plugin enable xmm7360.lte
+```
 
 ## Notes
 
