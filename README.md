@@ -5,7 +5,8 @@ registers fine under Windows but never finds a network under Linux.
 
 Tested on a ThinkPad X1 Yoga Gen 5 (20UB), Arch Linux (Omarchy), kernel 7.2,
 `iosm` driver, ModemManager git `338ecc06`, with lifecell (UA) on LTE. Works
-from a cold boot (full power-off) with no manual steps.
+from a cold boot (full power-off) and after suspend (S3; it reconnects about a
+minute after wake-up) with no manual steps.
 
 ## Symptom
 
