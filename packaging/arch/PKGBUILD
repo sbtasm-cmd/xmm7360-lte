@@ -3,8 +3,8 @@
 pkgname=modemmanager-xmm7360-git
 _commit=338ecc06
 pkgver=1.25.95.r9609.g338ecc06
-pkgrel=3
-pkgdesc="ModemManager (git) with Intel XMM7360 support and protocol-stack power-on fix"
+pkgrel=4
+pkgdesc="ModemManager (git) with Intel XMM7360 fixes: protocol-stack power-on, SMS over RPC"
 arch=(x86_64)
 url="https://www.freedesktop.org/wiki/Software/ModemManager/"
 license=(GPL-2.0-or-later LGPL-2.1-or-later)
@@ -13,8 +13,9 @@ makedepends=(git meson gobject-introspection glib2-devel)
 provides=(modemmanager=1.25.95 libmm-glib=1.25.95 libmm-glib.so)
 conflicts=(modemmanager libmm-glib)
 source=("mm::git+https://gitlab.freedesktop.org/mobile-broadband/ModemManager.git#commit=${_commit}"
-        0001-intel-xmm7360-power-on-the-protocol-stack.patch)
-sha256sums=(SKIP SKIP)
+        0001-intel-xmm7360-power-on-the-protocol-stack.patch
+        0002-intel-xmm7360-receive-SMS-over-RPC.patch)
+sha256sums=(SKIP SKIP SKIP)
 
 pkgver() {
   cd mm
@@ -24,6 +25,7 @@ pkgver() {
 prepare() {
   cd mm
   patch -Np1 -i ../0001-intel-xmm7360-power-on-the-protocol-stack.patch
+  patch -Np1 -i ../0002-intel-xmm7360-receive-SMS-over-RPC.patch
 }
 
 build() {

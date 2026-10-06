@@ -1,0 +1,388 @@
+From 8ee1ba32d08b44272eb58a4dd1a7f333175c6497 Mon Sep 17 00:00:00 2001
+From: "Nohdan S." <sbtasm@gmail.com>
+Date: Tue, 6 Oct 2026 14:32:31 +0300
+Subject: [PATCH 2/2] intel: xmm7360: receive SMS over RPC
+
+The firmware accepts no AT+CPMS storage, so the generic AT messaging
+implementation disables itself and incoming SMS are never seen.
+
+Incoming SMS arrive over RPC as UtaMsSmsIncomingIndCb (0x032), carrying
+the full PDU (SMSC + TPDU, 176-byte buffer) followed by the TPDU length,
+and the host must acknowledge them with UtaMsSmsIncomingSmsAck (0x036),
+echoing the indication's transaction id (tipd). The ack layout was
+recovered from Lenovo's WinIhvRil.dll:
+  B(0) S(176 zero bytes) B(0) L(0) B(tipd) L(0)
+
+Implement the Messaging interface for the XMM7360 RPC modem: MT storage
+only (messages live in ModemManager), no-op storage locking, and while
+enabled, keep the RPC port open with a handler that parses each
+indication, hands the part to the Messaging interface (multipart messages
+get assembled there), and acks it.
+---
+ .../intel/mm-broadband-modem-xmm7360.c        | 319 ++++++++++++++++++
+ 1 file changed, 319 insertions(+)
+
+diff --git a/src/plugins/intel/mm-broadband-modem-xmm7360.c b/src/plugins/intel/mm-broadband-modem-xmm7360.c
+index 1d8bcfb3..a561801b 100644
+--- a/src/plugins/intel/mm-broadband-modem-xmm7360.c
++++ b/src/plugins/intel/mm-broadband-modem-xmm7360.c
+@@ -31,6 +31,8 @@
+ #include "mm-log-object.h"
+ #include "mm-iface-modem.h"
+ #include "mm-iface-modem-3gpp.h"
++#include "mm-iface-modem-messaging.h"
++#include "mm-sms-part-3gpp.h"
+ #include "mm-broadband-modem-xmm.h"
+ 
+ #include "mm-broadband-modem-xmm7360.h"
+@@ -44,6 +46,7 @@
+ static void iface_modem_init (MMIfaceModemInterface *iface);
+ static void iface_modem_3gpp_init (MMIfaceModem3gppInterface *iface);
+ static void iface_shared_xmm_init (MMSharedXmmInterface *iface);
++static void iface_modem_messaging_init (MMIfaceModemMessagingInterface *iface);
+ 
+ static MMIfaceModemInterface *iface_modem_parent;
+ 
+@@ -51,11 +54,17 @@ G_DEFINE_TYPE_EXTENDED (MMBroadbandModemXmm7360, mm_broadband_modem_xmm7360, MM_
+                         G_IMPLEMENT_INTERFACE (MM_TYPE_IFACE_MODEM, iface_modem_init)
+                         G_IMPLEMENT_INTERFACE (MM_TYPE_IFACE_MODEM_3GPP, iface_modem_3gpp_init)
+                         G_IMPLEMENT_INTERFACE (MM_TYPE_SHARED_XMM, iface_shared_xmm_init)
++                        G_IMPLEMENT_INTERFACE (MM_TYPE_IFACE_MODEM_MESSAGING, iface_modem_messaging_init)
+ )
+ 
+ struct _MMBroadbandModemXmm7360Private {
+     MMUnlockRetries *unlock_retries;
+     GRegex *nmea_regex_full, *nmea_regex_trace;
++
++    /* SMS reception over RPC */
++    MMPortSerialXmmrpcXmm7360 *sms_port;
++    gboolean sms_port_open;
++    guint sms_unsol_handler_id;
+ };
+ 
+ /*****************************************************************************/
+@@ -1358,11 +1367,321 @@ dispose (GObject *object)
+     g_clear_pointer (&self->priv->nmea_regex_trace, g_regex_unref);
+     g_clear_pointer (&self->priv->nmea_regex_full, g_regex_unref);
+     g_clear_object (&self->priv->unlock_retries);
++    if (self->priv->sms_port && self->priv->sms_port_open)
++        mm_port_serial_close (MM_PORT_SERIAL (self->priv->sms_port));
++    g_clear_object (&self->priv->sms_port);
+ 
+     G_OBJECT_CLASS (mm_broadband_modem_xmm7360_parent_class)->dispose (object);
+ }
+ 
+ 
++/*****************************************************************************/
++/* Messaging (SMS over RPC)
++ *
++ * The firmware accepts no AT+CPMS storage, so the generic AT messaging
++ * implementation disables itself. Incoming SMS arrive over RPC instead, as
++ * UtaMsSmsIncomingIndCb, and the host acks them with UtaMsSmsIncomingSmsAck,
++ * echoing the indication's transaction id (tipd). Messages are kept in
++ * ModemManager (MT storage); nothing is stored on the modem.
++ *
++ * Indication fields (wire order): B, L, S(SMSC+TPDU, 176 bytes), B tpdu_len,
++ * L, H, L, B tipd, L.
++ * Ack body (from Lenovo's WinIhvRil.dll): B(0) S(176 zero bytes) B(0) L(0)
++ * B(tipd) L(0).
++ */
++
++#define XMM7360_SMS_PDU_BUFFER_SIZE 176
++
++static const guint8 sms_ack_empty_tpdu[XMM7360_SMS_PDU_BUFFER_SIZE] = { 0 };
++
++static void
++sms_ack_ready (MMBroadbandModemXmm7360 *self,
++               GAsyncResult            *res)
++{
++    g_autoptr(Xmm7360RpcResponse) response = NULL;
++    g_autoptr(GError)             error = NULL;
++
++    response = mm_broadband_modem_xmm7360_rpc_command_full_finish (self, res, &error);
++    if (error)
++        mm_obj_warn (self, "(intel) couldn't ack incoming SMS: %s", error->message);
++    else
++        mm_obj_dbg (self, "(intel) incoming SMS acked");
++}
++
++static void
++sms_send_ack (MMBroadbandModemXmm7360   *self,
++              MMPortSerialXmmrpcXmm7360 *port,
++              guint8                     tipd)
++{
++    g_autoptr(GByteArray) body = NULL;
++    const Xmm7360RpcMsgArg args[] = {
++        { XMM7360_RPC_MSG_ARG_TYPE_BYTE, { .b = 0 } },
++        { XMM7360_RPC_MSG_ARG_TYPE_STRING, { .string = (const gchar *) sms_ack_empty_tpdu }, XMM7360_SMS_PDU_BUFFER_SIZE, 0 },
++        { XMM7360_RPC_MSG_ARG_TYPE_BYTE, { .b = 0 } },
++        { XMM7360_RPC_MSG_ARG_TYPE_LONG, { .l = 0 } },
++        { XMM7360_RPC_MSG_ARG_TYPE_BYTE, { .b = (gint8) tipd } },
++        { XMM7360_RPC_MSG_ARG_TYPE_LONG, { .l = 0 } },
++        { XMM7360_RPC_MSG_ARG_TYPE_UNKNOWN },
++    };
++
++    body = xmm7360_rpc_args_to_byte_array (args);
++    mm_broadband_modem_xmm7360_rpc_command_full (self,
++                                                 port,
++                                                 XMM7360_RPC_CALL_UTA_MS_SMS_INCOMING_SMS_ACK,
++                                                 FALSE,
++                                                 body,
++                                                 3,
++                                                 FALSE,
++                                                 NULL,
++                                                 (GAsyncReadyCallback)sms_ack_ready,
++                                                 NULL);
++}
++
++static gboolean
++sms_unsol_handler (MMPortSerialXmmrpcXmm7360 *port,
++                   Xmm7360RpcResponse        *response,
++                   MMBroadbandModemXmm7360   *self)
++{
++    Xmm7360RpcMsgArg  *pdu_arg = NULL;
++    Xmm7360RpcMsgArg  *arg;
++    const guint8      *pdu;
++    gsize              pdu_len;
++    guint8             tpdu_len;
++    guint8             tipd;
++    guint              i;
++    MMSmsPart         *part;
++    g_autoptr(GError)  error = NULL;
++
++    if (response->unsol_id != XMM7360_RPC_UNSOL_UTA_MS_SMS_INCOMING_IND_CB)
++        return FALSE;
++
++    for (i = 0; i < response->content->len; i++) {
++        arg = g_ptr_array_index (response->content, i);
++        if (arg->type == XMM7360_RPC_MSG_ARG_TYPE_STRING) {
++            pdu_arg = arg;
++            break;
++        }
++    }
++
++    if (!pdu_arg || i + 1 >= response->content->len || response->content->len < 2) {
++        mm_obj_warn (self, "(intel) unexpected incoming SMS indication layout");
++        return TRUE;
++    }
++
++    arg = g_ptr_array_index (response->content, i + 1);
++    tpdu_len = (guint8) XMM7360_RPC_MSG_ARG_GET_INT (arg);
++    arg = g_ptr_array_index (response->content, response->content->len - 2);
++    tipd = (guint8) XMM7360_RPC_MSG_ARG_GET_INT (arg);
++
++    pdu = (const guint8 *) pdu_arg->value.string;
++    pdu_len = pdu_arg->size;
++    if (pdu_len > 0 && (gsize) pdu[0] + 1 + tpdu_len <= pdu_len)
++        pdu_len = (gsize) pdu[0] + 1 + tpdu_len;
++
++    mm_obj_dbg (self, "(intel) incoming SMS: %" G_GSIZE_FORMAT " PDU bytes, tipd 0x%02x", pdu_len, tipd);
++
++    part = mm_sms_part_3gpp_new_from_binary_pdu (SMS_PART_INVALID_INDEX, pdu, pdu_len, self, FALSE, &error);
++    if (!part)
++        mm_obj_warn (self, "(intel) couldn't parse incoming SMS PDU: %s", error->message);
++    else if (!mm_iface_modem_messaging_take_part (MM_IFACE_MODEM_MESSAGING (self),
++                                                  mm_broadband_modem_create_sms (MM_BROADBAND_MODEM (self)),
++                                                  part,
++                                                  MM_SMS_STATE_RECEIVED,
++                                                  MM_SMS_STORAGE_MT,
++                                                  &error))
++        mm_obj_warn (self, "(intel) couldn't add incoming SMS: %s", error->message);
++
++    /* Ack even when parsing failed, otherwise the network keeps resending it */
++    sms_send_ack (self, port, tipd);
++    return TRUE;
++}
++
++static gboolean
++messaging_check_support_finish (MMIfaceModemMessaging  *self,
++                                GAsyncResult           *res,
++                                GError                **error)
++{
++    return g_task_propagate_boolean (G_TASK (res), error);
++}
++
++static void
++messaging_check_support (MMIfaceModemMessaging *self,
++                         GAsyncReadyCallback    callback,
++                         gpointer               user_data)
++{
++    GTask *task;
++
++    task = g_task_new (self, NULL, callback, user_data);
++    g_task_return_boolean (task, TRUE);
++    g_object_unref (task);
++}
++
++static gboolean
++messaging_load_supported_storages_finish (MMIfaceModemMessaging  *self,
++                                          GAsyncResult           *res,
++                                          GArray                **mem1,
++                                          GArray                **mem2,
++                                          GArray                **mem3,
++                                          GError                **error)
++{
++    MMSmsStorage supported = MM_SMS_STORAGE_MT;
++
++    if (!g_task_propagate_boolean (G_TASK (res), error))
++        return FALSE;
++
++    *mem1 = g_array_sized_new (FALSE, FALSE, sizeof (MMSmsStorage), 1);
++    g_array_append_val (*mem1, supported);
++    *mem2 = g_array_ref (*mem1);
++    *mem3 = g_array_ref (*mem1);
++    return TRUE;
++}
++
++static void
++messaging_load_supported_storages (MMIfaceModemMessaging *self,
++                                   GAsyncReadyCallback    callback,
++                                   gpointer               user_data)
++{
++    GTask *task;
++
++    task = g_task_new (self, NULL, callback, user_data);
++    g_task_return_boolean (task, TRUE);
++    g_object_unref (task);
++}
++
++/* Nothing is stored on the modem, so storage locking is a no-op */
++static gboolean
++messaging_lock_storages_finish (MMIfaceModemMessaging  *self,
++                                GAsyncResult           *res,
++                                GError                **error)
++{
++    return g_task_propagate_boolean (G_TASK (res), error);
++}
++
++static void
++messaging_lock_storages (MMIfaceModemMessaging *self,
++                         MMSmsStorage           mem1,
++                         MMSmsStorage           mem2,
++                         GAsyncReadyCallback    callback,
++                         gpointer               user_data)
++{
++    GTask *task;
++
++    task = g_task_new (self, NULL, callback, user_data);
++    g_task_return_boolean (task, TRUE);
++    g_object_unref (task);
++}
++
++static void
++messaging_unlock_storages (MMIfaceModemMessaging *self,
++                           gboolean               mem1,
++                           gboolean               mem2)
++{
++}
++
++static gboolean
++messaging_enable_disable_unsolicited_events_finish (MMIfaceModemMessaging  *self,
++                                                    GAsyncResult           *res,
++                                                    GError                **error)
++{
++    return g_task_propagate_boolean (G_TASK (res), error);
++}
++
++static void
++messaging_enable_unsolicited_events (MMIfaceModemMessaging *_self,
++                                     GAsyncReadyCallback    callback,
++                                     gpointer               user_data)
++{
++    MMBroadbandModemXmm7360 *self = MM_BROADBAND_MODEM_XMM7360 (_self);
++    GError                  *error = NULL;
++    GTask                   *task;
++
++    task = g_task_new (self, NULL, callback, user_data);
++
++    if (!self->priv->sms_port)
++        self->priv->sms_port = mm_broadband_modem_xmm7360_get_port_xmmrpc (self);
++    if (!self->priv->sms_port) {
++        g_task_return_new_error (task, MM_CORE_ERROR, MM_CORE_ERROR_FAILED, "No XMMRPC port for SMS");
++        g_object_unref (task);
++        return;
++    }
++
++    /* Keep the RPC port open while enabled so indications have a listener */
++    if (!self->priv->sms_port_open && !mm_port_serial_open (MM_PORT_SERIAL (self->priv->sms_port), &error)) {
++        g_prefix_error (&error, "Couldn't open XMMRPC port for SMS: ");
++        g_task_return_error (task, error);
++        g_object_unref (task);
++        return;
++    }
++    self->priv->sms_port_open = TRUE;
++
++    /* Handlers can't be removed from the port, only toggled, so reuse ours */
++    if (self->priv->sms_unsol_handler_id)
++        mm_port_serial_xmmrpc_xmm7360_enable_unsolicited_msg_handler (self->priv->sms_port,
++                                                                      self->priv->sms_unsol_handler_id,
++                                                                      TRUE);
++    else
++        self->priv->sms_unsol_handler_id =
++            mm_port_serial_xmmrpc_xmm7360_add_unsolicited_msg_handler (self->priv->sms_port,
++                                                                       (MMPortSerialXmmrpcXmm7360UnsolicitedMsgFn)sms_unsol_handler,
++                                                                       self,
++                                                                       NULL);
++
++    mm_obj_dbg (self, "(intel) listening for incoming SMS over RPC");
++    g_task_return_boolean (task, TRUE);
++    g_object_unref (task);
++}
++
++static void
++messaging_disable_unsolicited_events (MMIfaceModemMessaging *_self,
++                                      GAsyncReadyCallback    callback,
++                                      gpointer               user_data)
++{
++    MMBroadbandModemXmm7360 *self = MM_BROADBAND_MODEM_XMM7360 (_self);
++    GTask                   *task;
++
++    task = g_task_new (self, NULL, callback, user_data);
++
++    if (self->priv->sms_port && self->priv->sms_unsol_handler_id)
++        mm_port_serial_xmmrpc_xmm7360_enable_unsolicited_msg_handler (self->priv->sms_port,
++                                                                      self->priv->sms_unsol_handler_id,
++                                                                      FALSE);
++    if (self->priv->sms_port && self->priv->sms_port_open) {
++        mm_port_serial_close (MM_PORT_SERIAL (self->priv->sms_port));
++        self->priv->sms_port_open = FALSE;
++    }
++
++    g_task_return_boolean (task, TRUE);
++    g_object_unref (task);
++}
++
++static void
++iface_modem_messaging_init (MMIfaceModemMessagingInterface *iface)
++{
++    iface->check_support = messaging_check_support;
++    iface->check_support_finish = messaging_check_support_finish;
++    iface->load_supported_storages = messaging_load_supported_storages;
++    iface->load_supported_storages_finish = messaging_load_supported_storages_finish;
++    iface->init_current_storages = NULL;
++    iface->init_current_storages_finish = NULL;
++    iface->set_default_storage = NULL;
++    iface->set_default_storage_finish = NULL;
++    iface->setup_sms_format = NULL;
++    iface->setup_sms_format_finish = NULL;
++    iface->lock_storages = messaging_lock_storages;
++    iface->lock_storages_finish = messaging_lock_storages_finish;
++    iface->unlock_storages = messaging_unlock_storages;
++    iface->setup_unsolicited_events = NULL;
++    iface->setup_unsolicited_events_finish = NULL;
++    iface->cleanup_unsolicited_events = NULL;
++    iface->cleanup_unsolicited_events_finish = NULL;
++    iface->enable_unsolicited_events = messaging_enable_unsolicited_events;
++    iface->enable_unsolicited_events_finish = messaging_enable_disable_unsolicited_events_finish;
++    iface->disable_unsolicited_events = messaging_disable_unsolicited_events;
++    iface->disable_unsolicited_events_finish = messaging_enable_disable_unsolicited_events_finish;
++    iface->load_initial_sms_parts = NULL;
++    iface->load_initial_sms_parts_finish = NULL;
++}
++
+ static void
+ iface_modem_init (MMIfaceModemInterface *iface)
+ {
+-- 
+2.55.0
+

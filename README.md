@@ -44,6 +44,7 @@ registers on LTE, and attaches. Details are in
 | Path | What |
 |---|---|
 | `patches/0001-intel-xmm7360-power-on-the-protocol-stack.patch` | ModemManager patch: sends both RPCs in the init sequence and after power-up |
+| `patches/0002-intel-xmm7360-receive-SMS-over-RPC.patch` | ModemManager patch: receives SMS over RPC (`UtaMsSmsIncomingIndCb`) and acks them (`UtaMsSmsIncomingSmsAck`) |
 | `packaging/arch/PKGBUILD` | Arch package `modemmanager-xmm7360-git` (ModemManager git + patch) |
 | `system/install-system.sh` | Installs the package plus the FCC-unlock drop-in, the runtime-PM udev rule, and the resume reset service |
 | `tools/` | Diagnostic scripts (raw RPC and AT); run `tools/fetch-xmm7360-rpc.sh` first |
@@ -80,6 +81,16 @@ switch now lives in its own repository:
 ```sh
 omarchy plugin add https://github.com/sbtasm-cmd/omarchy-lte.git --enable
 ```
+
+## SMS
+
+The firmware accepts no `AT+CPMS` storage, so stock ModemManager turns SMS off
+for this modem. Patch 0002 implements the Messaging interface over RPC.
+Incoming SMS arrive as `UtaMsSmsIncomingIndCb` (`0x032`), carrying the
+SMSC+TPDU PDU, and are acked with `UtaMsSmsIncomingSmsAck` (`0x036`) using the
+indication's transaction id (layout recovered from `WinIhvRil.dll`).
+Messages show up in `mmcli -m any --messaging-list-sms` (MT storage, kept in
+ModemManager). Sending SMS isn't implemented yet.
 
 ## Notes
 
