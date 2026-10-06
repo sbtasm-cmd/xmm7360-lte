@@ -87,15 +87,20 @@ SMS work with stock ModemManager once patch 0001 is applied. Without it the SIM
 isn't fully initialized (the protocol stack is off), `AT+CPMS` fails, and
 ModemManager disables messaging. With the stack on, ModemManager uses SIM
 storage (`sm`) over AT, reads stored messages, assembles multipart SMS, and
-receives new ones.
+receives new ones. Sending works too:
+
+```sh
+mmcli -m any --messaging-create-sms="number='+380XXXXXXXXX',text='Hello'"
+mmcli -s /org/freedesktop/ModemManager1/SMS/<n> --send
+```
 
 `patches/withdrawn/0002-…` was an RPC-based receive path
 (`UtaMsSmsIncomingIndCb` + `UtaMsSmsIncomingSmsAck`). It is withdrawn: it isn't
 needed, and keeping the RPC port open for indications broke data connections
 (bearer RPC commands timed out). It stays in the repo as protocol
 documentation. Sending SMS over RPC (`UtaMsSmsSendReq`) crashed the firmware in
-every attempted layout and isn't implemented; see the notes in
-docs/reverse-engineering.md.
+every attempted layout, which doesn't matter because sending over AT works; see
+the notes in docs/reverse-engineering.md.
 
 ## Notes
 
