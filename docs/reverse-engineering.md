@@ -82,3 +82,9 @@ After the two calls and `AT+COPS=0`:
 +COPS: 0,0,"lifecell",7
 UtaMsNetAttachReq -> 0x0, +CGATT: 1
 ```
+
+## SMS over RPC (for reference)
+
+- **Incoming:** `UtaMsSmsIncomingIndCb` (`0x032`) fields, wire order: `B, L, S(SMSC+TPDU, 176), B tpdu_len, L, H, L, B tipd, L`. Ack with `UtaMsSmsIncomingSmsAck` (`0x036`), body `B(0) S(176 zero bytes) B(0) L(0) B(tipd) L(0)`. The modem returned 0 to this ack.
+- **Outgoing:** `UtaMsSmsSendReq` (`0x031`) takes `(sim, struct*, ctx)`. Struct (0xC0 bytes): `u32 x=7 (+0), u8 len (+4), u8 pdu[0xB0] (+5, SMSC+TPDU), u32 msg_service=0 (+0xB8), u32 0 (+0xBC)`. Every layout derived from this (`B(0) L(0) L(0) S(pdu) B(len) L(x) L(sim)`) crashed the firmware ("ch[1]: confused phase 3", then "PORT open refused"). The exact wire bytes are still unknown. Emulating `RemUtaMsSmsSendReq` (Unicorn) would settle them.
+- SMS don't need RPC at all once the protocol stack is on, because `AT+CPMS`/CNMI work then.

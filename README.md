@@ -44,7 +44,6 @@ registers on LTE, and attaches. Details are in
 | Path | What |
 |---|---|
 | `patches/0001-intel-xmm7360-power-on-the-protocol-stack.patch` | ModemManager patch: sends both RPCs in the init sequence and after power-up |
-| `patches/0002-intel-xmm7360-receive-SMS-over-RPC.patch` | ModemManager patch: receives SMS over RPC (`UtaMsSmsIncomingIndCb`) and acks them (`UtaMsSmsIncomingSmsAck`) |
 | `packaging/arch/PKGBUILD` | Arch package `modemmanager-xmm7360-git` (ModemManager git + patch) |
 | `system/install-system.sh` | Installs the package plus the FCC-unlock drop-in, the runtime-PM udev rule, and the resume reset service |
 | `tools/` | Diagnostic scripts (raw RPC and AT); run `tools/fetch-xmm7360-rpc.sh` first |
@@ -84,13 +83,19 @@ omarchy plugin add https://github.com/sbtasm-cmd/omarchy-lte.git --enable
 
 ## SMS
 
-The firmware accepts no `AT+CPMS` storage, so stock ModemManager turns SMS off
-for this modem. Patch 0002 implements the Messaging interface over RPC.
-Incoming SMS arrive as `UtaMsSmsIncomingIndCb` (`0x032`), carrying the
-SMSC+TPDU PDU, and are acked with `UtaMsSmsIncomingSmsAck` (`0x036`) using the
-indication's transaction id (layout recovered from `WinIhvRil.dll`).
-Messages show up in `mmcli -m any --messaging-list-sms` (MT storage, kept in
-ModemManager). Sending SMS isn't implemented yet.
+SMS work with stock ModemManager once patch 0001 is applied. Without it the SIM
+isn't fully initialized (the protocol stack is off), `AT+CPMS` fails, and
+ModemManager disables messaging. With the stack on, ModemManager uses SIM
+storage (`sm`) over AT, reads stored messages, assembles multipart SMS, and
+receives new ones.
+
+`patches/withdrawn/0002-…` was an RPC-based receive path
+(`UtaMsSmsIncomingIndCb` + `UtaMsSmsIncomingSmsAck`). It is withdrawn: it isn't
+needed, and keeping the RPC port open for indications broke data connections
+(bearer RPC commands timed out). It stays in the repo as protocol
+documentation. Sending SMS over RPC (`UtaMsSmsSendReq`) crashed the firmware in
+every attempted layout and isn't implemented; see the notes in
+docs/reverse-engineering.md.
 
 ## Notes
 
